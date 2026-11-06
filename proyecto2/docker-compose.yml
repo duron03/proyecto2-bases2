@@ -1,0 +1,70 @@
+name: wwi-proyecto2
+
+x-sql-common: &sql-common
+  image: mcr.microsoft.com/mssql/server@sha256:86cc6144ef39bb0fbed2329e1ad79b13ee82e7b2e4739213a0db0800e668a74a
+  platform: linux/amd64
+  restart: unless-stopped
+  environment: &sql-environment
+    ACCEPT_EULA: "Y"
+    MSSQL_PID: EnterpriseDeveloper
+    MSSQL_AGENT_ENABLED: "true"
+    MSSQL_MEMORY_LIMIT_MB: "1200"
+    MSSQL_SA_PASSWORD: ${MSSQL_SA_PASSWORD:?Configure MSSQL_SA_PASSWORD in proyecto2/.env}
+  networks:
+    - wwi-red
+  healthcheck:
+    test:
+      - CMD-SHELL
+      - /opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P "$$MSSQL_SA_PASSWORD" -C -Q "SELECT 1" -b -o /dev/null
+    interval: 10s
+    timeout: 5s
+    retries: 30
+    start_period: 30s
+
+services:
+  corporativo:
+    <<: *sql-common
+    container_name: wwi-corp
+    hostname: wwi-corp
+    environment:
+      <<: *sql-environment
+      MSSQL_MEMORY_LIMIT_MB: "2000"
+    ports:
+      - "14331:1433"
+    volumes:
+      - wwi-corp-data:/var/opt/mssql
+      - ./sql:/opt/proyecto2/sql:ro
+      - ./backups:/var/opt/mssql/backup:ro
+
+  san-jose:
+    <<: *sql-common
+    container_name: wwi-sj
+    hostname: wwi-sj
+    ports:
+      - "14332:1433"
+    volumes:
+      - wwi-sj-data:/var/opt/mssql
+      - ./sql:/opt/proyecto2/sql:ro
+
+  limon:
+    <<: *sql-common
+    container_name: wwi-limon
+    hostname: wwi-limon
+    ports:
+      - "14333:1433"
+    volumes:
+      - wwi-limon-data:/var/opt/mssql
+      - ./sql:/opt/proyecto2/sql:ro
+
+networks:
+  wwi-red:
+    name: wwi-proyecto2-red
+
+volumes:
+  wwi-corp-data:
+    name: wwi-proyecto2-corp-data
+  wwi-sj-data:
+    name: wwi-proyecto2-sj-data
+  wwi-limon-data:
+    name: wwi-proyecto2-limon-data
+

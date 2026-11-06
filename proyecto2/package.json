@@ -1,0 +1,19 @@
+{
+  "name": "wwi-proyecto2-tools",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "env:generate": "node tools/generar-env-local.js",
+    "preflight": "node tools/preflight.js",
+    "facts:load": "node tools/cargar-hechos.js",
+    "replication:distributors": "node tools/configurar-replicacion.js distribuidores",
+    "replication:catalog": "node tools/configurar-replicacion.js catalogo",
+    "replication:facts": "node tools/configurar-replicacion.js hechos"
+  },
+  "dependencies": {
+    "dotenv": "^18.0.3",
+    "mssql": "^12.7.2"
+  }
+}
+
