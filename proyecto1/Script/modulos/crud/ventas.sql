@@ -1,165 +1,180 @@
 USE [WideWorldImporters];
 GO
 
--- Sinónimos utilizados por el CRUD de ventas.
-IF OBJECT_ID('dbo.src_Factura', 'SN') IS NULL
-    EXEC('CREATE SYNONYM dbo.src_Factura FOR Sales.Invoices;');
+SET ANSI_NULLS ON;
+GO
+SET QUOTED_IDENTIFIER ON;
 GO
 
-IF OBJECT_ID('dbo.src_DetalleFactura', 'SN') IS NULL
-    EXEC('CREATE SYNONYM dbo.src_DetalleFactura FOR Sales.InvoiceLines;');
-GO
-
-IF OBJECT_ID('dbo.src_Producto', 'SN') IS NULL
-    EXEC('CREATE SYNONYM dbo.src_Producto FOR Warehouse.StockItems;');
-GO
-
-IF OBJECT_ID('dbo.src_Existencia', 'SN') IS NULL
-    EXEC('CREATE SYNONYM dbo.src_Existencia FOR Warehouse.StockItemHoldings;');
-GO
-
--- Reemplaza las líneas de una factura y calcula sus valores derivados.
+-- Procedimiento interno. Las rutas de la API no reciben permiso directo sobre el.
 CREATE OR ALTER PROCEDURE dbo.usp_Ventas_GuardarDetalles
     @InvoiceID int,
     @InvoiceLines nvarchar(max),
-    @LastEditedBy int
+    @LastEditedBy int,
+    @EsCreacion bit = 0
 AS
 BEGIN
     SET NOCOUNT ON;
+    SET XACT_ABORT ON;
 
-    BEGIN TRY
-        BEGIN TRANSACTION;
+    IF @InvoiceLines IS NULL OR ISJSON(@InvoiceLines) <> 1
+        THROW 50303, 'Los detalles de la venta no tienen un formato valido.', 1;
 
-        IF @InvoiceLines IS NULL OR ISJSON(@InvoiceLines) = 0
-            THROW 50303, 'Debe enviar el detalle de la factura.', 1;
+    DECLARE @Lines TABLE
+    (
+        LineNumber int NOT NULL,
+        StockItemID int NULL,
+        Quantity int NULL,
+        UnitPrice decimal(18, 2) NULL,
+        TaxRate decimal(18, 3) NULL
+    );
 
-        DECLARE @Lines TABLE
-        (
-            StockItemID int,
-            Quantity int,
-            UnitPrice decimal(18, 2),
-            TaxRate decimal(18, 3)
-        );
+    INSERT INTO @Lines (LineNumber, StockItemID, Quantity, UnitPrice, TaxRate)
+    SELECT
+        CONVERT(int, J.[key]),
+        D.StockItemID,
+        D.Quantity,
+        D.UnitPrice,
+        D.TaxRate
+    FROM OPENJSON(@InvoiceLines) AS J
+    CROSS APPLY OPENJSON(J.[value])
+    WITH
+    (
+        StockItemID int '$.StockItemID',
+        Quantity int '$.Quantity',
+        UnitPrice decimal(18, 2) '$.UnitPrice',
+        TaxRate decimal(18, 3) '$.TaxRate'
+    ) AS D;
 
-        INSERT INTO @Lines
-        (
-            StockItemID,
-            Quantity,
-            UnitPrice,
-            TaxRate
-        )
-        SELECT
-            StockItemID,
-            Quantity,
-            UnitPrice,
-            TaxRate
-        FROM OPENJSON(@InvoiceLines)
-        WITH
-        (
-            StockItemID int,
-            Quantity int,
-            UnitPrice decimal(18, 2),
-            TaxRate decimal(18, 3)
-        );
+    IF NOT EXISTS (SELECT 1 FROM @Lines)
+        THROW 50303, 'La venta debe contener al menos un detalle.', 1;
 
-        IF NOT EXISTS (SELECT 1 FROM @Lines)
-            THROW 50303, 'La factura debe tener al menos una línea.', 1;
+    IF EXISTS
+    (
+        SELECT 1
+        FROM @Lines
+        WHERE StockItemID IS NULL OR Quantity IS NULL OR Quantity <= 0
+           OR UnitPrice IS NULL OR UnitPrice < 0
+           OR TaxRate IS NULL OR TaxRate < 0
+    )
+        THROW 50304, 'Uno o mas detalles contienen valores invalidos.', 1;
 
-        IF EXISTS
-        (
-            SELECT 1
-            FROM @Lines
-            WHERE StockItemID IS NULL
-                OR Quantity IS NULL
-                OR Quantity <= 0
-                OR UnitPrice IS NULL
-                OR UnitPrice < 0
-                OR TaxRate IS NULL
-                OR TaxRate < 0
-        )
-            THROW 50304, 'Revise el producto, cantidad, precio e impuesto de cada línea.', 1;
-
-        IF EXISTS
-        (
-            SELECT 1
-            FROM @Lines AS L
-            LEFT JOIN dbo.src_Producto AS SI
-                ON L.StockItemID = SI.StockItemID
-            LEFT JOIN dbo.src_Existencia AS H
-                ON L.StockItemID = H.StockItemID
-            WHERE SI.StockItemID IS NULL
-                OR H.StockItemID IS NULL
-        )
-            THROW 50304, 'Una línea contiene un producto inválido.', 1;
-
-        DELETE FROM dbo.src_DetalleFactura
-        WHERE InvoiceID = @InvoiceID;
-
-        INSERT INTO dbo.src_DetalleFactura
-        (
-            InvoiceLineID,
-            InvoiceID,
-            StockItemID,
-            Description,
-            PackageTypeID,
-            Quantity,
-            UnitPrice,
-            TaxRate,
-            TaxAmount,
-            LineProfit,
-            ExtendedPrice,
-            LastEditedBy
-        )
-        SELECT
-            NEXT VALUE FOR Sequences.InvoiceLineID,
-            @InvoiceID,
-            L.StockItemID,
-            SI.StockItemName,
-            SI.UnitPackageID,
-            L.Quantity,
-            L.UnitPrice,
-            L.TaxRate,
-            CAST(L.Quantity * L.UnitPrice * L.TaxRate / 100 AS decimal(18, 2)),
-            CAST(L.Quantity * (L.UnitPrice - H.LastCostPrice) AS decimal(18, 2)),
-            CAST(
-                (L.Quantity * L.UnitPrice)
-                + (L.Quantity * L.UnitPrice * L.TaxRate / 100)
-                AS decimal(18, 2)
-            ),
-            @LastEditedBy
+    IF EXISTS
+    (
+        SELECT 1
         FROM @Lines AS L
-        INNER JOIN dbo.src_Producto AS SI
+        LEFT JOIN Warehouse.StockItems AS SI
             ON L.StockItemID = SI.StockItemID
-        INNER JOIN dbo.src_Existencia AS H
-            ON L.StockItemID = H.StockItemID;
+        WHERE SI.StockItemID IS NULL
+    )
+        THROW 50201, 'Uno de los productos no existe.', 1;
 
-        DECLARE @TotalDryItems int;
-        DECLARE @TotalChillerItems int;
-
-        SELECT
-            @TotalDryItems = SUM(CASE WHEN SI.IsChillerStock = 0 THEN 1 ELSE 0 END),
-            @TotalChillerItems = SUM(CASE WHEN SI.IsChillerStock = 1 THEN 1 ELSE 0 END)
+    IF EXISTS
+    (
+        SELECT 1
         FROM @Lines AS L
-        INNER JOIN dbo.src_Producto AS SI
-            ON L.StockItemID = SI.StockItemID;
+        LEFT JOIN Warehouse.StockItemHoldings AS H
+            ON L.StockItemID = H.StockItemID
+        WHERE H.StockItemID IS NULL
+    )
+        THROW 50202, 'Configure las existencias de este producto en su sucursal.', 1;
 
-        UPDATE dbo.src_Factura
-        SET TotalDryItems = @TotalDryItems,
-            TotalChillerItems = @TotalChillerItems
-        WHERE InvoiceID = @InvoiceID;
+    IF @EsCreacion = 1
+       AND EXISTS
+       (
+           SELECT 1
+           FROM @Lines AS L
+           INNER JOIN Warehouse.StockItems AS SI
+               ON L.StockItemID = SI.StockItemID
+           WHERE SI.Activo = 0
+       )
+        THROW 50402, 'No se puede agregar un producto inactivo a una venta nueva.', 1;
 
-        COMMIT TRANSACTION;
-    END TRY
-    BEGIN CATCH
-        IF @@TRANCOUNT > 0
-            ROLLBACK TRANSACTION;
+    IF @EsCreacion = 0
+    BEGIN
+        ;WITH Nuevas AS
+        (
+            SELECT StockItemID, SUM(Quantity) AS Cantidad
+            FROM @Lines
+            GROUP BY StockItemID
+        ),
+        Anteriores AS
+        (
+            SELECT StockItemID, SUM(Quantity) AS Cantidad
+            FROM Sales.InvoiceLines
+            WHERE InvoiceID = @InvoiceID
+            GROUP BY StockItemID
+        )
+        SELECT 1 AS Dato
+        INTO #IncrementosInactivos
+        FROM Warehouse.StockItems AS SI
+        LEFT JOIN Nuevas AS N ON SI.StockItemID = N.StockItemID
+        LEFT JOIN Anteriores AS A ON SI.StockItemID = A.StockItemID
+        WHERE SI.Activo = 0
+          AND COALESCE(N.Cantidad, 0) > COALESCE(A.Cantidad, 0);
 
-        THROW;
-    END CATCH;
+        IF EXISTS (SELECT 1 FROM #IncrementosInactivos)
+        BEGIN
+            DROP TABLE #IncrementosInactivos;
+            THROW 50402, 'No se puede agregar ni aumentar un producto inactivo.', 1;
+        END;
+
+        DROP TABLE #IncrementosInactivos;
+    END;
+
+    DELETE FROM Sales.InvoiceLines
+    WHERE InvoiceID = @InvoiceID;
+
+    INSERT INTO Sales.InvoiceLines
+    (
+        InvoiceLineID, InvoiceID, StockItemID, Description,
+        PackageTypeID, Quantity, UnitPrice, TaxRate,
+        TaxAmount, LineProfit, ExtendedPrice,
+        LastEditedBy, LastEditedWhen
+    )
+    SELECT
+        NEXT VALUE FOR Sequences.InvoiceLineID,
+        @InvoiceID,
+        L.StockItemID,
+        SI.StockItemName,
+        SI.UnitPackageID,
+        L.Quantity,
+        L.UnitPrice,
+        L.TaxRate,
+        CONVERT(decimal(18, 2), ROUND(L.Quantity * L.UnitPrice * L.TaxRate / 100.0, 2)),
+        CONVERT(decimal(18, 2), L.Quantity * (L.UnitPrice - H.LastCostPrice)),
+        CONVERT(decimal(18, 2),
+            L.Quantity * L.UnitPrice
+            + ROUND(L.Quantity * L.UnitPrice * L.TaxRate / 100.0, 2)),
+        @LastEditedBy,
+        SYSUTCDATETIME()
+    FROM @Lines AS L
+    INNER JOIN Warehouse.StockItems AS SI
+        ON L.StockItemID = SI.StockItemID
+    INNER JOIN Warehouse.StockItemHoldings AS H
+        ON L.StockItemID = H.StockItemID;
+
+    UPDATE Sales.Invoices
+    SET TotalDryItems =
+        (
+            SELECT COUNT(*)
+            FROM @Lines AS L
+            INNER JOIN Warehouse.StockItems AS SI ON L.StockItemID = SI.StockItemID
+            WHERE SI.IsChillerStock = 0
+        ),
+        TotalChillerItems =
+        (
+            SELECT COUNT(*)
+            FROM @Lines AS L
+            INNER JOIN Warehouse.StockItems AS SI ON L.StockItemID = SI.StockItemID
+            WHERE SI.IsChillerStock = 1
+        ),
+        LastEditedBy = @LastEditedBy,
+        LastEditedWhen = SYSUTCDATETIME()
+    WHERE InvoiceID = @InvoiceID;
 END;
 GO
 
--- Crea el encabezado de una venta.
 CREATE OR ALTER PROCEDURE dbo.usp_Ventas_Crear
     @CustomerID int,
     @BillToCustomerID int,
@@ -169,7 +184,7 @@ CREATE OR ALTER PROCEDURE dbo.usp_Ventas_Crear
     @SalespersonPersonID int,
     @PackedByPersonID int,
     @InvoiceDate date,
-    @LastEditedBy int,
+    @LastEditedBy int = NULL,
     @OrderID int = NULL,
     @CustomerPurchaseOrderNumber nvarchar(20) = NULL,
     @IsCreditNote bit = 0,
@@ -186,82 +201,75 @@ CREATE OR ALTER PROCEDURE dbo.usp_Ventas_Crear
 AS
 BEGIN
     SET NOCOUNT ON;
+    SET XACT_ABORT ON;
+
+    DECLARE @Actor int;
+    DECLARE @SucursalUsuario int;
+    DECLARE @SucursalNodo int;
+
+    SELECT @Actor = PersonID, @SucursalUsuario = SucursalID
+    FROM Seguridad.IdentidadesLocales
+    WHERE SqlLogin = ORIGINAL_LOGIN() AND active = 1;
+
+    SELECT @SucursalNodo = SucursalID FROM Control.Nodo WHERE Id = 1;
+
+    IF @Actor IS NULL OR @SucursalUsuario <> @SucursalNodo
+        THROW 50403, 'El usuario no puede crear ventas en esta sucursal.', 1;
+
+    IF NOT EXISTS
+    (
+        SELECT 1 FROM Sales.Customers
+        WHERE CustomerID = @CustomerID AND Activo = 1
+    )
+        THROW 50402, 'El cliente esta inactivo o no existe.', 1;
+
+    IF NOT EXISTS
+    (
+        SELECT 1 FROM Sales.Customers
+        WHERE CustomerID = @BillToCustomerID AND Activo = 1
+    )
+        THROW 50402, 'El cliente de facturacion esta inactivo o no existe.', 1;
 
     BEGIN TRY
         BEGIN TRANSACTION;
 
         DECLARE @NewInvoiceID int = NEXT VALUE FOR Sequences.InvoiceID;
 
-        INSERT INTO dbo.src_Factura
+        INSERT INTO Sales.Invoices
         (
-            InvoiceID,
-            CustomerID,
-            BillToCustomerID,
-            OrderID,
-            DeliveryMethodID,
-            ContactPersonID,
-            AccountsPersonID,
-            SalespersonPersonID,
-            PackedByPersonID,
-            InvoiceDate,
-            CustomerPurchaseOrderNumber,
-            IsCreditNote,
-            CreditNoteReason,
-            Comments,
-            DeliveryInstructions,
-            InternalComments,
-            TotalDryItems,
-            TotalChillerItems,
-            DeliveryRun,
-            RunPosition,
-            ReturnedDeliveryData,
-            LastEditedBy
+            InvoiceID, CustomerID, BillToCustomerID, OrderID, DeliveryMethodID,
+            ContactPersonID, AccountsPersonID, SalespersonPersonID, PackedByPersonID,
+            InvoiceDate, CustomerPurchaseOrderNumber, IsCreditNote,
+            CreditNoteReason, Comments, DeliveryInstructions, InternalComments,
+            TotalDryItems, TotalChillerItems, DeliveryRun, RunPosition,
+            ReturnedDeliveryData, LastEditedBy, LastEditedWhen, VersionVenta
         )
         VALUES
         (
-            @NewInvoiceID,
-            @CustomerID,
-            @BillToCustomerID,
-            @OrderID,
-            @DeliveryMethodID,
-            @ContactPersonID,
-            @AccountsPersonID,
-            @SalespersonPersonID,
-            @PackedByPersonID,
-            @InvoiceDate,
-            @CustomerPurchaseOrderNumber,
-            @IsCreditNote,
-            @CreditNoteReason,
-            @Comments,
-            @DeliveryInstructions,
-            @InternalComments,
-            @TotalDryItems,
-            @TotalChillerItems,
-            @DeliveryRun,
-            @RunPosition,
-            @ReturnedDeliveryData,
-            @LastEditedBy
+            @NewInvoiceID, @CustomerID, @BillToCustomerID, @OrderID, @DeliveryMethodID,
+            @ContactPersonID, @AccountsPersonID, @SalespersonPersonID, @PackedByPersonID,
+            @InvoiceDate, @CustomerPurchaseOrderNumber, @IsCreditNote,
+            @CreditNoteReason, @Comments, @DeliveryInstructions, @InternalComments,
+            0, 0, @DeliveryRun, @RunPosition,
+            @ReturnedDeliveryData, @Actor, SYSUTCDATETIME(), 1
         );
 
         EXEC dbo.usp_Ventas_GuardarDetalles
             @InvoiceID = @NewInvoiceID,
             @InvoiceLines = @InvoiceLines,
-            @LastEditedBy = @LastEditedBy;
-
-        SELECT @NewInvoiceID AS InvoiceID;
+            @LastEditedBy = @Actor,
+            @EsCreacion = 1;
 
         COMMIT TRANSACTION;
+        SELECT @NewInvoiceID AS InvoiceID, 1 AS VersionVenta;
     END TRY
     BEGIN CATCH
-        IF @@TRANCOUNT > 0
-            ROLLBACK TRANSACTION;
-
+        IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION;
         THROW;
     END CATCH;
 END;
 GO
 
--- Actualiza todos los datos editables del encabezado de una venta.
 CREATE OR ALTER PROCEDURE dbo.usp_Ventas_Actualizar
     @InvoiceID int,
     @CustomerID int,
@@ -272,7 +280,8 @@ CREATE OR ALTER PROCEDURE dbo.usp_Ventas_Actualizar
     @SalespersonPersonID int,
     @PackedByPersonID int,
     @InvoiceDate date,
-    @LastEditedBy int,
+    @VersionEsperada int,
+    @LastEditedBy int = NULL,
     @OrderID int = NULL,
     @CustomerPurchaseOrderNumber nvarchar(20) = NULL,
     @IsCreditNote bit = 0,
@@ -289,14 +298,53 @@ CREATE OR ALTER PROCEDURE dbo.usp_Ventas_Actualizar
 AS
 BEGIN
     SET NOCOUNT ON;
+    SET XACT_ABORT ON;
+
+    DECLARE @Actor int;
+    DECLARE @SucursalUsuario int;
+    DECLARE @SucursalNodo int;
+    DECLARE @CustomerActual int;
+    DECLARE @BillToActual int;
+
+    SELECT @Actor = PersonID, @SucursalUsuario = SucursalID
+    FROM Seguridad.IdentidadesLocales
+    WHERE SqlLogin = ORIGINAL_LOGIN() AND active = 1;
+
+    SELECT @SucursalNodo = SucursalID FROM Control.Nodo WHERE Id = 1;
+
+    IF @Actor IS NULL OR @SucursalUsuario <> @SucursalNodo
+        THROW 50403, 'El usuario no puede modificar ventas en esta sucursal.', 1;
+
+    SELECT @CustomerActual = CustomerID, @BillToActual = BillToCustomerID
+    FROM Sales.Invoices
+    WHERE InvoiceID = @InvoiceID;
+
+    IF @CustomerActual IS NULL
+        THROW 50301, 'La venta no existe.', 1;
+
+    IF @CustomerID <> @CustomerActual
+       AND NOT EXISTS
+       (
+           SELECT 1 FROM Sales.Customers
+           WHERE CustomerID = @CustomerID AND Activo = 1
+       )
+        THROW 50402, 'El cliente seleccionado esta inactivo.', 1;
+
+    IF @BillToCustomerID <> @BillToActual
+       AND NOT EXISTS
+       (
+           SELECT 1 FROM Sales.Customers
+           WHERE CustomerID = @BillToCustomerID AND Activo = 1
+       )
+        THROW 50402, 'El cliente de facturacion esta inactivo.', 1;
 
     BEGIN TRY
         BEGIN TRANSACTION;
 
-        UPDATE dbo.src_Factura
+        UPDATE Sales.Invoices
         SET CustomerID = @CustomerID,
             BillToCustomerID = @BillToCustomerID,
-            OrderID = ISNULL(@OrderID, OrderID),
+            OrderID = @OrderID,
             DeliveryMethodID = @DeliveryMethodID,
             ContactPersonID = @ContactPersonID,
             AccountsPersonID = @AccountsPersonID,
@@ -305,217 +353,85 @@ BEGIN
             InvoiceDate = @InvoiceDate,
             CustomerPurchaseOrderNumber = @CustomerPurchaseOrderNumber,
             IsCreditNote = @IsCreditNote,
-            CreditNoteReason = ISNULL(@CreditNoteReason, CreditNoteReason),
+            CreditNoteReason = @CreditNoteReason,
             Comments = @Comments,
             DeliveryInstructions = @DeliveryInstructions,
-            InternalComments = ISNULL(@InternalComments, InternalComments),
-            TotalDryItems = ISNULL(@TotalDryItems, TotalDryItems),
-            TotalChillerItems = ISNULL(@TotalChillerItems, TotalChillerItems),
-            DeliveryRun = ISNULL(@DeliveryRun, DeliveryRun),
-            RunPosition = ISNULL(@RunPosition, RunPosition),
-            ReturnedDeliveryData = ISNULL(@ReturnedDeliveryData, ReturnedDeliveryData),
-            LastEditedBy = @LastEditedBy,
-            LastEditedWhen = SYSDATETIME()
-        WHERE InvoiceID = @InvoiceID;
+            InternalComments = @InternalComments,
+            DeliveryRun = @DeliveryRun,
+            RunPosition = @RunPosition,
+            ReturnedDeliveryData = @ReturnedDeliveryData,
+            LastEditedBy = @Actor,
+            LastEditedWhen = SYSUTCDATETIME(),
+            VersionVenta = VersionVenta + 1
+        WHERE InvoiceID = @InvoiceID
+          AND VersionVenta = @VersionEsperada;
 
         IF @@ROWCOUNT = 0
-            THROW 50301, 'La venta no existe.', 1;
-
-        IF @InvoiceLines IS NOT NULL
         BEGIN
-            EXEC dbo.usp_Ventas_GuardarDetalles
-                @InvoiceID = @InvoiceID,
-                @InvoiceLines = @InvoiceLines,
-                @LastEditedBy = @LastEditedBy;
+            IF NOT EXISTS (SELECT 1 FROM Sales.Invoices WHERE InvoiceID = @InvoiceID)
+                THROW 50301, 'La venta no existe.', 1;
+            THROW 50401, 'La venta fue modificada por otra sesion.', 1;
         END;
 
-        SELECT @InvoiceID AS InvoiceID;
+        EXEC dbo.usp_Ventas_GuardarDetalles
+            @InvoiceID = @InvoiceID,
+            @InvoiceLines = @InvoiceLines,
+            @LastEditedBy = @Actor,
+            @EsCreacion = 0;
 
         COMMIT TRANSACTION;
+        SELECT @InvoiceID AS InvoiceID, @VersionEsperada + 1 AS VersionVenta;
     END TRY
     BEGIN CATCH
-        IF @@TRANCOUNT > 0
-            ROLLBACK TRANSACTION;
-
+        IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION;
         THROW;
     END CATCH;
 END;
 GO
 
--- Agrega una línea al detalle de la venta.
-CREATE OR ALTER PROCEDURE dbo.usp_Ventas_AgregarDetalle
-    @InvoiceID int,
-    @StockItemID int,
-    @Description nvarchar(100),
-    @PackageTypeID int,
-    @Quantity int,
-    @UnitPrice decimal(18, 2),
-    @TaxRate decimal(18, 3),
-    @TaxAmount decimal(18, 2),
-    @LineProfit decimal(18, 2),
-    @ExtendedPrice decimal(18, 2),
-    @LastEditedBy int
-AS
-BEGIN
-    SET NOCOUNT ON;
-
-    BEGIN TRY
-        BEGIN TRANSACTION;
-
-        DECLARE @NewInvoiceLineID int = NEXT VALUE FOR Sequences.InvoiceLineID;
-
-        INSERT INTO dbo.src_DetalleFactura
-        (
-            InvoiceLineID,
-            InvoiceID,
-            StockItemID,
-            Description,
-            PackageTypeID,
-            Quantity,
-            UnitPrice,
-            TaxRate,
-            TaxAmount,
-            LineProfit,
-            ExtendedPrice,
-            LastEditedBy
-        )
-        VALUES
-        (
-            @NewInvoiceLineID,
-            @InvoiceID,
-            @StockItemID,
-            @Description,
-            @PackageTypeID,
-            @Quantity,
-            @UnitPrice,
-            @TaxRate,
-            @TaxAmount,
-            @LineProfit,
-            @ExtendedPrice,
-            @LastEditedBy
-        );
-
-        SELECT @NewInvoiceLineID AS InvoiceLineID;
-
-        COMMIT TRANSACTION;
-    END TRY
-    BEGIN CATCH
-        IF @@TRANCOUNT > 0
-            ROLLBACK TRANSACTION;
-
-        THROW;
-    END CATCH;
-END;
-GO
-
--- Actualiza una línea del detalle de la venta.
-CREATE OR ALTER PROCEDURE dbo.usp_Ventas_ActualizarDetalle
-    @InvoiceLineID int,
-    @InvoiceID int,
-    @StockItemID int,
-    @Description nvarchar(100),
-    @PackageTypeID int,
-    @Quantity int,
-    @UnitPrice decimal(18, 2),
-    @TaxRate decimal(18, 3),
-    @TaxAmount decimal(18, 2),
-    @LineProfit decimal(18, 2),
-    @ExtendedPrice decimal(18, 2),
-    @LastEditedBy int
-AS
-BEGIN
-    SET NOCOUNT ON;
-
-    BEGIN TRY
-        BEGIN TRANSACTION;
-
-        UPDATE dbo.src_DetalleFactura
-        SET InvoiceID = @InvoiceID,
-            StockItemID = @StockItemID,
-            Description = @Description,
-            PackageTypeID = @PackageTypeID,
-            Quantity = @Quantity,
-            UnitPrice = @UnitPrice,
-            TaxRate = @TaxRate,
-            TaxAmount = @TaxAmount,
-            LineProfit = @LineProfit,
-            ExtendedPrice = @ExtendedPrice,
-            LastEditedBy = @LastEditedBy,
-            LastEditedWhen = SYSDATETIME()
-        WHERE InvoiceLineID = @InvoiceLineID;
-
-        IF @@ROWCOUNT = 0
-            THROW 50302, 'La línea de venta no existe.', 1;
-
-        SELECT @InvoiceLineID AS InvoiceLineID;
-
-        COMMIT TRANSACTION;
-    END TRY
-    BEGIN CATCH
-        IF @@TRANCOUNT > 0
-            ROLLBACK TRANSACTION;
-
-        THROW;
-    END CATCH;
-END;
-GO
-
--- Elimina una línea de la venta.
-CREATE OR ALTER PROCEDURE dbo.usp_Ventas_EliminarDetalle
-    @InvoiceLineID int
-AS
-BEGIN
-    SET NOCOUNT ON;
-
-    BEGIN TRY
-        BEGIN TRANSACTION;
-
-        DELETE FROM dbo.src_DetalleFactura
-        WHERE InvoiceLineID = @InvoiceLineID;
-
-        IF @@ROWCOUNT = 0
-            THROW 50302, 'La línea de venta no existe.', 1;
-
-        SELECT @InvoiceLineID AS InvoiceLineID;
-
-        COMMIT TRANSACTION;
-    END TRY
-    BEGIN CATCH
-        IF @@TRANCOUNT > 0
-            ROLLBACK TRANSACTION;
-
-        THROW;
-    END CATCH;
-END;
-GO
-
--- Elimina primero las líneas y después el encabezado de la venta.
 CREATE OR ALTER PROCEDURE dbo.usp_Ventas_Eliminar
-    @InvoiceID int
+    @InvoiceID int,
+    @VersionEsperada int
 AS
 BEGIN
     SET NOCOUNT ON;
+    SET XACT_ABORT ON;
+
+    DECLARE @Actor int;
+    DECLARE @SucursalUsuario int;
+    DECLARE @SucursalNodo int;
+
+    SELECT @Actor = PersonID, @SucursalUsuario = SucursalID
+    FROM Seguridad.IdentidadesLocales
+    WHERE SqlLogin = ORIGINAL_LOGIN() AND active = 1;
+
+    SELECT @SucursalNodo = SucursalID FROM Control.Nodo WHERE Id = 1;
+
+    IF @Actor IS NULL OR @SucursalUsuario <> @SucursalNodo
+        THROW 50403, 'El usuario no puede eliminar ventas en esta sucursal.', 1;
 
     BEGIN TRY
         BEGIN TRANSACTION;
 
-        DELETE FROM dbo.src_DetalleFactura
+        DECLARE @VersionActual int;
+        SELECT @VersionActual = VersionVenta
+        FROM Sales.Invoices WITH (UPDLOCK, HOLDLOCK)
         WHERE InvoiceID = @InvoiceID;
 
-        DELETE FROM dbo.src_Factura
-        WHERE InvoiceID = @InvoiceID;
-
-        IF @@ROWCOUNT = 0
+        IF @VersionActual IS NULL
             THROW 50301, 'La venta no existe.', 1;
 
-        SELECT @InvoiceID AS InvoiceID;
+        IF @VersionActual <> @VersionEsperada
+            THROW 50401, 'La venta fue modificada por otra sesion.', 1;
+
+        DELETE FROM Sales.InvoiceLines WHERE InvoiceID = @InvoiceID;
+        DELETE FROM Sales.Invoices WHERE InvoiceID = @InvoiceID;
 
         COMMIT TRANSACTION;
+        SELECT @InvoiceID AS InvoiceID;
     END TRY
     BEGIN CATCH
-        IF @@TRANCOUNT > 0
-            ROLLBACK TRANSACTION;
-
+        IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION;
         THROW;
     END CATCH;
 END;
