@@ -1,79 +1,44 @@
 USE [WideWorldImporters];
 GO
 
--- Sinónimos utilizados por el reporte 4.
-IF OBJECT_ID('dbo.src_Factura', 'SN') IS NULL
-    EXEC('CREATE SYNONYM dbo.src_Factura FOR Sales.Invoices;');
-GO
-
-IF OBJECT_ID('dbo.src_DetalleFactura', 'SN') IS NULL
-    EXEC('CREATE SYNONYM dbo.src_DetalleFactura FOR Sales.InvoiceLines;');
-GO
-
-IF OBJECT_ID('dbo.src_Producto', 'SN') IS NULL
-    EXEC('CREATE SYNONYM dbo.src_Producto FOR Warehouse.StockItems;');
-GO
-
-IF OBJECT_ID('dbo.src_ProductoGrupo', 'SN') IS NULL
-    EXEC('CREATE SYNONYM dbo.src_ProductoGrupo FOR Warehouse.StockItemStockGroups;');
-GO
-
-IF OBJECT_ID('dbo.src_GrupoProducto', 'SN') IS NULL
-    EXEC('CREATE SYNONYM dbo.src_GrupoProducto FOR Warehouse.StockGroups;');
-GO
-
--- Muestra una matriz cruzando las categorías de productos con los años de venta.
+-- Matriz historica fija de 2013 a 2016, igual que en el proyecto anterior.
 CREATE OR ALTER PROCEDURE dbo.usp_Estadisticas_Reporte6
-    @StockGroupName nvarchar(100) = NULL
+    @StockGroupName nvarchar(100) = NULL,
+    @SucursalID int = NULL
 AS
 BEGIN
     SET NOCOUNT ON;
+    EXEC Seguridad.usp_ValidarAlcanceReporte @SucursalID OUTPUT;
 
-    BEGIN TRY
-        BEGIN TRANSACTION;
-
-        WITH CTE_BaseData AS (
-            SELECT
-                ISNULL(SG.StockGroupName, 'No Category') AS StockGroupName,
-                YEAR(I.InvoiceDate) AS InvoiceYear,
-                IL.ExtendedPrice
-            FROM dbo.src_Factura AS I
-            INNER JOIN dbo.src_DetalleFactura AS IL
-                ON I.InvoiceID = IL.InvoiceID
-            INNER JOIN dbo.src_Producto AS SI
-                ON IL.StockItemID = SI.StockItemID
-            LEFT JOIN dbo.src_ProductoGrupo AS SISG
-                ON SI.StockItemID = SISG.StockItemID
-            LEFT JOIN dbo.src_GrupoProducto AS SG
-                ON SISG.StockGroupID = SG.StockGroupID
-            WHERE
-                (
-                    @StockGroupName IS NULL
-                    OR SG.StockGroupName LIKE '%' + @StockGroupName + '%'
-                )
-        )
-        SELECT 
-            StockGroupName,
-            ISNULL([2013], 0) AS Sales_2013,
-            ISNULL([2014], 0) AS Sales_2014,
-            ISNULL([2015], 0) AS Sales_2015,
-            ISNULL([2016], 0) AS Sales_2016,
-            (ISNULL([2013], 0) + ISNULL([2014], 0) + ISNULL([2015], 0) + ISNULL([2016], 0)) AS GrandTotal
-        FROM CTE_BaseData
-        PIVOT (
-            SUM(ExtendedPrice)
-            FOR InvoiceYear IN ([2013], [2014], [2015], [2016])
-        ) AS PivotMatrix
-        ORDER BY 
-            GrandTotal DESC;
-
-        COMMIT TRANSACTION;
-    END TRY
-    BEGIN CATCH
-        IF @@TRANCOUNT > 0
-            ROLLBACK TRANSACTION;
-
-        THROW;
-    END CATCH;
+    ;WITH Base AS
+    (
+        SELECT
+            COALESCE(SG.StockGroupName, N'No Category') AS StockGroupName,
+            YEAR(I.InvoiceDate) AS InvoiceYear,
+            IL.ExtendedPrice
+        FROM Corporativo.v_Invoices AS I
+        INNER JOIN Corporativo.v_InvoiceLines AS IL
+            ON I.SucursalID = IL.SucursalID AND I.InvoiceID = IL.InvoiceID
+        INNER JOIN Warehouse.StockItems AS SI ON IL.StockItemID = SI.StockItemID
+        LEFT JOIN Warehouse.StockItemStockGroups AS SISG
+            ON SI.StockItemID = SISG.StockItemID
+        LEFT JOIN Warehouse.StockGroups AS SG ON SISG.StockGroupID = SG.StockGroupID
+        WHERE (@SucursalID IS NULL OR I.SucursalID = @SucursalID)
+          AND (@StockGroupName IS NULL OR SG.StockGroupName LIKE N'%' + @StockGroupName + N'%')
+    )
+    SELECT
+        StockGroupName,
+        COALESCE([2013], 0) AS Sales_2013,
+        COALESCE([2014], 0) AS Sales_2014,
+        COALESCE([2015], 0) AS Sales_2015,
+        COALESCE([2016], 0) AS Sales_2016,
+        COALESCE([2013], 0) + COALESCE([2014], 0)
+            + COALESCE([2015], 0) + COALESCE([2016], 0) AS GrandTotal
+    FROM Base
+    PIVOT
+    (
+        SUM(ExtendedPrice) FOR InvoiceYear IN ([2013], [2014], [2015], [2016])
+    ) AS Matriz
+    ORDER BY GrandTotal DESC, StockGroupName;
 END;
 GO

@@ -9,7 +9,16 @@
     "facts:load": "node tools/cargar-hechos.js",
     "replication:distributors": "node tools/configurar-replicacion.js distribuidores",
     "replication:catalog": "node tools/configurar-replicacion.js catalogo",
-    "replication:facts": "node tools/configurar-replicacion.js hechos"
+    "replication:facts": "node tools/configurar-replicacion.js hechos",
+    "sql:security": "node tools/instalar-hito-sql.js seguridad",
+    "sql:operations": "node tools/instalar-hito-sql.js operaciones",
+    "sql:reports": "node tools/instalar-hito-sql.js reportes",
+    "sql:permissions": "node tools/instalar-hito-sql.js permisos",
+    "sql:summary-job": "node tools/instalar-hito-sql.js job",
+    "sql:milestone": "node tools/instalar-hito-sql.js completo",
+    "test:security-reports": "node tools/probar-seguridad-reportes.js",
+    "test:crud-concurrency": "node tools/probar-crud-concurrencia.js",
+    "test:report-oracles": "node tools/validar-oraculos-reportes.js"
   },
   "dependencies": {
     "dotenv": "^18.0.3",

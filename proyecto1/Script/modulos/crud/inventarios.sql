@@ -1,20 +1,12 @@
 USE [WideWorldImporters];
 GO
 
--- Sinónimos utilizados por el CRUD de inventarios.
-IF OBJECT_ID('dbo.src_Producto', 'SN') IS NULL
-    EXEC('CREATE SYNONYM dbo.src_Producto FOR Warehouse.StockItems;');
+SET ANSI_NULLS ON;
+GO
+SET QUOTED_IDENTIFIER ON;
 GO
 
-IF OBJECT_ID('dbo.src_Existencia', 'SN') IS NULL
-    EXEC('CREATE SYNONYM dbo.src_Existencia FOR Warehouse.StockItemHoldings;');
-GO
-
-IF OBJECT_ID('dbo.src_ProductoGrupo', 'SN') IS NULL
-    EXEC('CREATE SYNONYM dbo.src_ProductoGrupo FOR Warehouse.StockItemStockGroups;');
-GO
-
--- Crea el producto y su registro de existencias en una sola transacción.
+-- Este archivo modifica solo el catalogo compartido y se instala en Corporativo.
 CREATE OR ALTER PROCEDURE dbo.usp_Inventarios_Crear
     @StockItemName nvarchar(100),
     @SupplierID int,
@@ -26,13 +18,7 @@ CREATE OR ALTER PROCEDURE dbo.usp_Inventarios_Crear
     @TaxRate decimal(18, 3),
     @UnitPrice decimal(18, 2),
     @TypicalWeightPerUnit decimal(18, 3),
-    @QuantityOnHand int,
-    @BinLocation nvarchar(20),
-    @LastStocktakeQuantity int,
-    @LastCostPrice decimal(18, 2),
-    @ReorderLevel int,
-    @TargetStockLevel int,
-    @LastEditedBy int,
+    @LastEditedBy int = NULL,
     @ColorID int = NULL,
     @Brand nvarchar(50) = NULL,
     @Size nvarchar(20) = NULL,
@@ -46,114 +32,73 @@ CREATE OR ALTER PROCEDURE dbo.usp_Inventarios_Crear
 AS
 BEGIN
     SET NOCOUNT ON;
+    SET XACT_ABORT ON;
+
+    DECLARE @Actor int;
+    SELECT @Actor = PersonID
+    FROM Seguridad.Usuarios
+    WHERE SqlLogin = ORIGINAL_LOGIN()
+      AND active = 1
+      AND rol = N'ADMINISTRADOR';
+
+    IF @Actor IS NULL
+        THROW 50403, 'El usuario no puede modificar productos.', 1;
+
+    IF NOT EXISTS
+    (
+        SELECT 1 FROM Purchasing.Suppliers
+        WHERE SupplierID = @SupplierID AND Activo = 1
+    )
+        THROW 50402, 'El proveedor seleccionado no esta activo.', 1;
 
     BEGIN TRY
         BEGIN TRANSACTION;
 
         DECLARE @NewStockItemID int = NEXT VALUE FOR Sequences.StockItemID;
 
-        INSERT INTO dbo.src_Producto
+        INSERT INTO Warehouse.StockItems
         (
-            StockItemID,
-            StockItemName,
-            SupplierID,
-            ColorID,
-            UnitPackageID,
-            OuterPackageID,
-            Brand,
-            Size,
-            LeadTimeDays,
-            QuantityPerOuter,
-            IsChillerStock,
-            Barcode,
-            TaxRate,
-            UnitPrice,
-            RecommendedRetailPrice,
-            TypicalWeightPerUnit,
-            MarketingComments,
-            InternalComments,
-            Photo,
-            CustomFields,
-            LastEditedBy
+            StockItemID, StockItemName, SupplierID, ColorID,
+            UnitPackageID, OuterPackageID, Brand, Size,
+            LeadTimeDays, QuantityPerOuter, IsChillerStock, Barcode,
+            TaxRate, UnitPrice, RecommendedRetailPrice, TypicalWeightPerUnit,
+            MarketingComments, InternalComments, Photo, CustomFields,
+            LastEditedBy, LastEditedWhen, Activo, VersionCatalogo
         )
         VALUES
         (
-            @NewStockItemID,
-            @StockItemName,
-            @SupplierID,
-            @ColorID,
-            @UnitPackageID,
-            @OuterPackageID,
-            @Brand,
-            @Size,
-            @LeadTimeDays,
-            @QuantityPerOuter,
-            @IsChillerStock,
-            @Barcode,
-            @TaxRate,
-            @UnitPrice,
-            @RecommendedRetailPrice,
-            @TypicalWeightPerUnit,
-            @MarketingComments,
-            @InternalComments,
-            @Photo,
-            @CustomFields,
-            @LastEditedBy
-        );
-
-        INSERT INTO dbo.src_Existencia
-        (
-            StockItemID,
-            QuantityOnHand,
-            BinLocation,
-            LastStocktakeQuantity,
-            LastCostPrice,
-            ReorderLevel,
-            TargetStockLevel,
-            LastEditedBy
-        )
-        VALUES
-        (
-            @NewStockItemID,
-            @QuantityOnHand,
-            @BinLocation,
-            @LastStocktakeQuantity,
-            @LastCostPrice,
-            @ReorderLevel,
-            @TargetStockLevel,
-            @LastEditedBy
+            @NewStockItemID, @StockItemName, @SupplierID, @ColorID,
+            @UnitPackageID, @OuterPackageID, @Brand, @Size,
+            @LeadTimeDays, @QuantityPerOuter, @IsChillerStock, @Barcode,
+            @TaxRate, @UnitPrice, @RecommendedRetailPrice, @TypicalWeightPerUnit,
+            @MarketingComments, @InternalComments, @Photo, @CustomFields,
+            @Actor, SYSUTCDATETIME(), 1, 1
         );
 
         IF @StockGroupID IS NOT NULL
         BEGIN
-            INSERT INTO dbo.src_ProductoGrupo
+            INSERT INTO Warehouse.StockItemStockGroups
             (
-                StockItemID,
-                StockGroupID,
-                LastEditedBy
+                StockItemStockGroupID, StockItemID, StockGroupID,
+                LastEditedBy, LastEditedWhen
             )
             VALUES
             (
-                @NewStockItemID,
-                @StockGroupID,
-                @LastEditedBy
+                NEXT VALUE FOR Sequences.StockItemStockGroupID,
+                @NewStockItemID, @StockGroupID, @Actor, SYSUTCDATETIME()
             );
         END;
 
-        SELECT @NewStockItemID AS StockItemID;
-
         COMMIT TRANSACTION;
+        SELECT @NewStockItemID AS StockItemID, 1 AS VersionCatalogo;
     END TRY
     BEGIN CATCH
-        IF @@TRANCOUNT > 0
-            ROLLBACK TRANSACTION;
-
+        IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION;
         THROW;
     END CATCH;
 END;
 GO
 
--- Actualiza el producto y sus existencias en una sola transacción.
 CREATE OR ALTER PROCEDURE dbo.usp_Inventarios_Actualizar
     @StockItemID int,
     @StockItemName nvarchar(100),
@@ -166,13 +111,8 @@ CREATE OR ALTER PROCEDURE dbo.usp_Inventarios_Actualizar
     @TaxRate decimal(18, 3),
     @UnitPrice decimal(18, 2),
     @TypicalWeightPerUnit decimal(18, 3),
-    @QuantityOnHand int,
-    @BinLocation nvarchar(20),
-    @LastStocktakeQuantity int,
-    @LastCostPrice decimal(18, 2),
-    @ReorderLevel int,
-    @TargetStockLevel int,
-    @LastEditedBy int,
+    @VersionEsperada int,
+    @LastEditedBy int = NULL,
     @ColorID int = NULL,
     @Brand nvarchar(50) = NULL,
     @Size nvarchar(20) = NULL,
@@ -185,11 +125,37 @@ CREATE OR ALTER PROCEDURE dbo.usp_Inventarios_Actualizar
 AS
 BEGIN
     SET NOCOUNT ON;
+    SET XACT_ABORT ON;
 
+    DECLARE @Actor int;
+    SELECT @Actor = PersonID
+    FROM Seguridad.Usuarios
+    WHERE SqlLogin = ORIGINAL_LOGIN()
+      AND active = 1
+      AND rol = N'ADMINISTRADOR';
+
+    IF @Actor IS NULL
+        THROW 50403, 'El usuario no puede modificar productos.', 1;
+
+    IF @VersionEsperada <= 0
+        THROW 50401, 'La version esperada no es valida.', 1;
+
+    DECLARE @SupplierActual int;
+    SELECT @SupplierActual = SupplierID
+    FROM Warehouse.StockItems
+    WHERE StockItemID = @StockItemID;
+
+    IF @SupplierID <> COALESCE(@SupplierActual, @SupplierID)
+       AND NOT EXISTS
+       (
+           SELECT 1 FROM Purchasing.Suppliers
+           WHERE SupplierID = @SupplierID AND Activo = 1
+       )
+        THROW 50402, 'El proveedor seleccionado no esta activo.', 1;
+
+    BEGIN TRANSACTION;
     BEGIN TRY
-        BEGIN TRANSACTION;
-
-        UPDATE dbo.src_Producto
+        UPDATE Warehouse.StockItems
         SET StockItemName = @StockItemName,
             SupplierID = @SupplierID,
             ColorID = @ColorID,
@@ -206,154 +172,74 @@ BEGIN
             RecommendedRetailPrice = @RecommendedRetailPrice,
             TypicalWeightPerUnit = @TypicalWeightPerUnit,
             MarketingComments = @MarketingComments,
-            InternalComments = ISNULL(@InternalComments, InternalComments),
-            Photo = ISNULL(@Photo, Photo),
-            CustomFields = ISNULL(@CustomFields, CustomFields),
-            LastEditedBy = @LastEditedBy
-        WHERE StockItemID = @StockItemID;
+            InternalComments = @InternalComments,
+            Photo = @Photo,
+            CustomFields = @CustomFields,
+            LastEditedBy = @Actor,
+            LastEditedWhen = SYSUTCDATETIME(),
+            VersionCatalogo = VersionCatalogo + 1
+        WHERE StockItemID = @StockItemID
+          AND VersionCatalogo = @VersionEsperada
+          AND Activo = 1;
 
         IF @@ROWCOUNT = 0
-            THROW 50201, 'El producto no existe.', 1;
-
-        UPDATE dbo.src_Existencia
-        SET QuantityOnHand = @QuantityOnHand,
-            BinLocation = @BinLocation,
-            LastStocktakeQuantity = @LastStocktakeQuantity,
-            LastCostPrice = @LastCostPrice,
-            ReorderLevel = @ReorderLevel,
-            TargetStockLevel = @TargetStockLevel,
-            LastEditedBy = @LastEditedBy,
-            LastEditedWhen = SYSDATETIME()
-        WHERE StockItemID = @StockItemID;
-
-        IF @@ROWCOUNT = 0
-            THROW 50202, 'El producto no tiene un registro de existencias.', 1;
-
-        SELECT @StockItemID AS StockItemID;
-
-        COMMIT TRANSACTION;
-    END TRY
-    BEGIN CATCH
-        IF @@TRANCOUNT > 0
-            ROLLBACK TRANSACTION;
-
-        THROW;
-    END CATCH;
-END;
-GO
-
--- Agrega un producto a un grupo. No duplica la relación si ya existe.
-CREATE OR ALTER PROCEDURE dbo.usp_Inventarios_AsignarGrupo
-    @StockItemID int,
-    @StockGroupID int,
-    @LastEditedBy int
-AS
-BEGIN
-    SET NOCOUNT ON;
-
-    BEGIN TRY
-        BEGIN TRANSACTION;
-
-        IF NOT EXISTS
-        (
-            SELECT 1
-            FROM dbo.src_ProductoGrupo
-            WHERE StockItemID = @StockItemID
-                AND StockGroupID = @StockGroupID
-        )
         BEGIN
-            INSERT INTO dbo.src_ProductoGrupo
-            (
-                StockItemID,
-                StockGroupID,
-                LastEditedBy
-            )
-            VALUES
-            (
-                @StockItemID,
-                @StockGroupID,
-                @LastEditedBy
-            );
+            IF NOT EXISTS (SELECT 1 FROM Warehouse.StockItems WHERE StockItemID = @StockItemID)
+                THROW 50201, 'El producto no existe.', 1;
+            THROW 50401, 'El producto fue modificado por otra sesion o esta inactivo.', 1;
         END;
 
-        SELECT
-            @StockItemID AS StockItemID,
-            @StockGroupID AS StockGroupID;
-
         COMMIT TRANSACTION;
+        SELECT @StockItemID AS StockItemID, @VersionEsperada + 1 AS VersionCatalogo;
     END TRY
     BEGIN CATCH
-        IF @@TRANCOUNT > 0
-            ROLLBACK TRANSACTION;
-
+        IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION;
         THROW;
     END CATCH;
 END;
 GO
 
--- Quita un producto de un grupo.
-CREATE OR ALTER PROCEDURE dbo.usp_Inventarios_QuitarGrupo
-    @StockItemID int,
-    @StockGroupID int
-AS
-BEGIN
-    SET NOCOUNT ON;
-
-    BEGIN TRY
-        BEGIN TRANSACTION;
-
-        DELETE FROM dbo.src_ProductoGrupo
-        WHERE StockItemID = @StockItemID
-            AND StockGroupID = @StockGroupID;
-
-        IF @@ROWCOUNT = 0
-            THROW 50203, 'El producto no pertenece al grupo indicado.', 1;
-
-        SELECT
-            @StockItemID AS StockItemID,
-            @StockGroupID AS StockGroupID;
-
-        COMMIT TRANSACTION;
-    END TRY
-    BEGIN CATCH
-        IF @@TRANCOUNT > 0
-            ROLLBACK TRANSACTION;
-
-        THROW;
-    END CATCH;
-END;
-GO
-
--- Elimina primero las relaciones propias del inventario y después el producto.
 CREATE OR ALTER PROCEDURE dbo.usp_Inventarios_Eliminar
-    @StockItemID int
+    @StockItemID int,
+    @VersionEsperada int
 AS
 BEGIN
     SET NOCOUNT ON;
+    SET XACT_ABORT ON;
 
+    DECLARE @Actor int;
+    SELECT @Actor = PersonID
+    FROM Seguridad.Usuarios
+    WHERE SqlLogin = ORIGINAL_LOGIN()
+      AND active = 1
+      AND rol = N'ADMINISTRADOR';
+
+    IF @Actor IS NULL
+        THROW 50403, 'El usuario no puede dar de baja productos.', 1;
+
+    BEGIN TRANSACTION;
     BEGIN TRY
-        BEGIN TRANSACTION;
-
-        DELETE FROM dbo.src_ProductoGrupo
-        WHERE StockItemID = @StockItemID;
-
-        DELETE FROM dbo.src_Existencia
-        WHERE StockItemID = @StockItemID;
-
-        DELETE FROM dbo.src_Producto
-        WHERE StockItemID = @StockItemID;
+        UPDATE Warehouse.StockItems
+        SET Activo = 0,
+            VersionCatalogo = VersionCatalogo + 1,
+            LastEditedBy = @Actor,
+            LastEditedWhen = SYSUTCDATETIME()
+        WHERE StockItemID = @StockItemID
+          AND VersionCatalogo = @VersionEsperada
+          AND Activo = 1;
 
         IF @@ROWCOUNT = 0
-            THROW 50201, 'El producto no existe.', 1;
-
-        SELECT @StockItemID AS StockItemID;
+        BEGIN
+            IF NOT EXISTS (SELECT 1 FROM Warehouse.StockItems WHERE StockItemID = @StockItemID)
+                THROW 50201, 'El producto no existe.', 1;
+            THROW 50401, 'El producto fue modificado por otra sesion o ya esta inactivo.', 1;
+        END;
 
         COMMIT TRANSACTION;
+        SELECT @StockItemID AS StockItemID, @VersionEsperada + 1 AS VersionCatalogo;
     END TRY
     BEGIN CATCH
-        IF @@TRANCOUNT > 0
-            ROLLBACK TRANSACTION;
-
+        IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION;
         THROW;
     END CATCH;
 END;
