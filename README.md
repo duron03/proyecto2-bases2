@@ -4,16 +4,21 @@
 - Julián Pizarro Castro (2024146595).
 
 ### Estado del proyecto:
-En curso.
+Finalizado.
 
 ### Objetivos del proyecto.
 
 #### Cumplidos:
-
-#### No cumplidos:
-
-### Enlace del video:
-
+- Las tres instancias de SQL Server.
+- Fragmentación horizontal y vertical de Wide World Importers.
+- Replicación transaccional de catálogos y operaciones.
+- Datos privados almacenados únicamente en Corporativo.
+- Usuarios y permisos diferentes para administradores y Corporativo.
+- Control de concurrencia mediante versiones.
+- CRUD de clientes, proveedores, inventario y ventas.
+- Reportes 1–8 y 10 por sede o global.
+- Resumen mensual materializado.
+- API con autenticación y GUI adaptada a cada rol.
 
 ---
 
