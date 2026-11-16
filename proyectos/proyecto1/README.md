@@ -1,7 +1,5 @@
 # proyecto1-bases2
 
-> Este directorio conserva la base del primer proyecto. En el proyecto 2 la API, la interfaz y los procedimientos fueron adaptados para trabajar con los tres nodos. Las instrucciones vigentes están en el [README principal](../../README.md).
-
 ### Nombre y carné de los integrantes: 
 - Noé López Durón (2024234500).
 - Julián Pizarro Castro (2024146595).
